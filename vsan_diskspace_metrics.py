@@ -124,7 +124,9 @@ def main() -> int:
     ap.add_argument("--insecure", action="store_true", help="TLS 인증서 검증을 생략한다")
     args = ap.parse_args()
 
-    host = args.host.rstrip("/")
+    host = args.host.strip().rstrip("/")
+    if not host.startswith("http://") and not host.startswith("https://"):
+        host = f"https://{host}"
     password = args.password or getpass.getpass("비밀번호: ")
     ctx = _ssl_context(verify=not args.insecure)
 
