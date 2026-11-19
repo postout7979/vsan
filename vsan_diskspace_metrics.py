@@ -1,499 +1,164 @@
 #!/usr/bin/env python3
+"""VCF Operations(vROps) Suite API에서 vSAN 어댑터의 "vSAN Cluster" 리소스가 갖는
+Metrics 중 "vSAN > Disk Space" 그룹(statKey 접두사 vsan|diskSpace|) 전체 항목의
+최신 값을 조회한다. vSAN 클러스터가 여러 개면 모두 순회해서 출력한다.
+
+사용 예:
+    python3 vsan_diskspace_metrics.py --host https://vcf-ops01.example.com \
+        --username admin --password '...' --insecure
 """
-vsan_diskspace_metrics.py
 
-Fetch the "vSAN > Disk Space" metric group for a vSAN Cluster resource
-(VSAN adapter) from VCF Operations (the former vRealize/Aria Operations),
-using the Suite API (/suite-api/api/...).
-
-Metrics collected (as shown under vSAN > Disk Space in the UI):
-  - Disk Space Used (%)
-  - Effective Capacity Remaining (%)
-  - Free Effective Capacity (GB)
-  - Provisioned Effective Capacity (GB)
-  - Total Disk Space (GB)
-  - Total Effective Capacity (GB)
-  - Usable Capacity (GB)
-  - Used Disk Space (GB)
-  - Used Effective Capacity (GB)
-
-How it works
-------------
-1. Log in and obtain a Suite API bearer token.
-2. Find the vSAN Cluster resource (adapter kind "VSAN") by name.
-3. Look up the resource kind's attribute (metric) definitions, and match
-   the ones whose display name is in the list above. This avoids
-   hard-coding the internal stat-key strings, which can differ slightly
-   between versions.
-4. Query the latest value for each matched stat key.
-5. Print a table, and optionally write the result to a JSON or CSV file.
-
-Assumptions / not verified
----------------------------
-- VCF Operations 9.1 is assumed to expose the same Suite API
-  (/suite-api/api/...) used by vRealize/Aria Operations (auth, resources,
-  resources/query, adaptertypes/.../attributes, stats/latest). This has
-  not been tested against a live VCF 9.1 Operations instance; if an
-  endpoint path has changed, adjust the *_PATH constants near the top.
-- The vSAN adapter kind key is assumed to be "VirtualAndPhysicalSANAdapter"
-  and its cluster resource kind "VirtualSANDCCluster" (the values used in
-  vRealize/Aria Operations). The script first tries these, then falls
-  back to searching /suite-api/api/adapterkinds and
-  /adapterkinds/{key}/resourcekinds for a key/name containing "vsan" /
-  "cluster". Use --adapter-kind / --resource-kind to force specific keys.
-- Self-signed certificates are common in closed/air-gapped environments;
-  use --insecure to skip TLS verification (off by default).
-
-Usage
------
-  # Fetch every vSAN Cluster resource found under vSAN Adapter > vSAN Cluster:
-  python3 vsan_diskspace_metrics.py --host vcfops.example.local
-
-  # Address scheme is optional - "https://" is added automatically if missing.
-  # Username / password are prompted for if not supplied on the command line.
-
-  # Limit to one cluster by name:
-  python3 vsan_diskspace_metrics.py \
-      --host vcfops.example.local \
-      --username admin \
-      --cluster "vSAN-Cluster-01" \
-      --insecure \
-      --output-json result.json \
-      --output-csv result.csv
-"""
+from __future__ import annotations
 
 import argparse
-import csv
 import getpass
-import json
 import sys
-import urllib3
-from typing import Any, Dict, List, Optional
 
-import requests
+import httpx
 
-# ---------------------------------------------------------------------------
-# Suite API paths (standard vRealize / Aria / VCF Operations Suite API)
-# ---------------------------------------------------------------------------
-TOKEN_ACQUIRE_PATH = "/suite-api/api/auth/token/acquire"
-TOKEN_RELEASE_PATH = "/suite-api/api/auth/token/release"
-RESOURCES_QUERY_PATH = "/suite-api/api/resources/query"
-ATTRIBUTES_PATH = "/suite-api/api/adapterkinds/{adapter_kind}/resourcekinds/{resource_kind}/attributes"
-STATS_LATEST_PATH = "/suite-api/api/resources/{resource_id}/stats/latest"
-ADAPTER_KINDS_PATH = "/suite-api/api/adapterkinds"
-RESOURCE_KINDS_PATH = "/suite-api/api/adapterkinds/{adapter_kind}/resourcekinds"
-
-# The vSAN adapter's kind key has been "VirtualAndPhysicalSANAdapter" in vRealize / Aria /
-# VCF Operations, with cluster resource kind "VirtualSANDCCluster". These are tried first;
-# discover_vsan_adapter_and_cluster_kind() falls back to searching /adapterkinds and
-# /adapterkinds/{key}/resourcekinds by name if they do not match your environment (these
-# keys can differ slightly between versions).
-DEFAULT_VSAN_ADAPTER_KIND = "VirtualAndPhysicalSANAdapter"
-DEFAULT_VSAN_CLUSTER_RESOURCE_KIND = "VirtualSANDCCluster"
-
-# Display names of the metrics shown under vSAN > Disk Space in the UI.
-TARGET_METRIC_NAMES = [
-    "Disk Space Used (%)",
-    "Effective Capacity Remaining (%)",
-    "Free Effective Capacity (GB)",
-    "Provisioned Effective Capacity (GB)",
-    "Total Disk Space (GB)",
-    "Total Effective Capacity (GB)",
-    "Usable Capacity (GB)",
-    "Used Disk Space (GB)",
-    "Used Effective Capacity (GB)",
-]
+DISKSPACE_PREFIX = "vsan|diskspace|"
 
 
-def normalize_host(host: str) -> str:
-    """Add https:// if the user did not include a scheme, and strip a trailing slash."""
-    host = host.strip()
-    if not host.lower().startswith(("http://", "https://")):
-        host = "https://" + host
-    return host.rstrip("/")
+class OpsApiError(Exception):
+    pass
 
 
-def acquire_token(
-    session: requests.Session,
-    base_url: str,
-    username: str,
-    password: str,
-    verify: bool,
-    auth_source: str = "LOCAL",
-) -> str:
-    """Log in to VCF Operations and return a Suite API bearer token.
-
-    auth_source should be "LOCAL" for a local VCF Operations account (the default and the
-    case this script targets). A VIDB/SSO account authenticates differently and is out of
-    scope here.
-    """
-    url = base_url + TOKEN_ACQUIRE_PATH
-    resp = session.post(
-        url,
-        json={"username": username, "password": password, "authSource": auth_source},
-        headers={"Accept": "application/json", "Content-Type": "application/json"},
-        verify=verify,
-    )
-    resp.raise_for_status()
+def acquire_token(host: str, username: str, password: str, auth_source: str, verify: bool) -> str:
+    try:
+        resp = httpx.post(
+            f"{host}/suite-api/api/auth/token/acquire",
+            json={"username": username, "password": password, "authSource": auth_source},
+            headers={"Accept": "application/json"},
+            verify=verify,
+            timeout=20.0,
+        )
+    except httpx.HTTPError as exc:
+        raise OpsApiError(f"접속 실패: {type(exc).__name__}: {exc}") from exc
+    if resp.status_code >= 400:
+        raise OpsApiError(f"로그인 실패 ({resp.status_code}): {resp.text[:300]}")
     token = resp.json().get("token")
     if not token:
-        raise RuntimeError("Login succeeded but no token was returned by the server.")
-    # "OpsToken" is the current scheme in VCF Operations 9.x. The older "vRealizeOpsToken"
-    # scheme is still accepted if your environment needs it.
-    session.headers.update({
-        "Authorization": f"OpsToken {token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    })
+        raise OpsApiError("로그인 응답에 token이 없습니다.")
     return token
 
 
-def release_token(session: requests.Session, base_url: str, verify: bool) -> None:
-    """Best-effort logout; failures here should not break the script."""
-    try:
-        session.post(base_url + TOKEN_RELEASE_PATH, verify=verify)
-    except requests.RequestException:
-        pass
-
-
-def discover_vsan_adapter_and_cluster_kind(
-    session: requests.Session,
-    base_url: str,
-    verify: bool,
-    adapter_kind_override: Optional[str] = None,
-    resource_kind_override: Optional[str] = None,
-):
-    """Work out the vSAN adapter kind key and its cluster resource kind key.
-
-    Uses the override(s) if given, then the documented defaults, then falls back to
-    searching /adapterkinds (by name/key containing "vsan") and
-    /adapterkinds/{key}/resourcekinds (by name/key containing "cluster"), so the script
-    still works if your VCF Operations version uses different keys.
-    """
-    if adapter_kind_override and resource_kind_override:
-        return adapter_kind_override, resource_kind_override
-
-    adapter_kind = adapter_kind_override
-    if not adapter_kind:
-        try:
-            resp = session.get(base_url + ADAPTER_KINDS_PATH, verify=verify)
-            resp.raise_for_status()
-            payload = resp.json()
-            kinds = payload.get("adapter-kind") or payload.get("adapterKind") or []
-            keys = {k.get("key", "") for k in kinds}
-            if DEFAULT_VSAN_ADAPTER_KIND in keys:
-                adapter_kind = DEFAULT_VSAN_ADAPTER_KIND
-            else:
-                matches = [
-                    k.get("key") for k in kinds
-                    if "vsan" in k.get("key", "").lower() or "vsan" in k.get("name", "").lower()
-                ]
-                adapter_kind = matches[0] if matches else DEFAULT_VSAN_ADAPTER_KIND
-        except requests.RequestException:
-            adapter_kind = DEFAULT_VSAN_ADAPTER_KIND
-
-    resource_kind = resource_kind_override
-    if not resource_kind:
-        try:
-            url = base_url + RESOURCE_KINDS_PATH.format(adapter_kind=adapter_kind)
-            resp = session.get(url, verify=verify)
-            resp.raise_for_status()
-            payload = resp.json()
-            rkinds = payload.get("resource-kind") or payload.get("resourceKind") or []
-            rkeys = {rk.get("key", "") for rk in rkinds}
-            if DEFAULT_VSAN_CLUSTER_RESOURCE_KIND in rkeys:
-                resource_kind = DEFAULT_VSAN_CLUSTER_RESOURCE_KIND
-            else:
-                matches = [
-                    rk.get("key") for rk in rkinds
-                    if "cluster" in rk.get("key", "").lower() or "cluster" in rk.get("name", "").lower()
-                ]
-                resource_kind = matches[0] if matches else None
-        except requests.RequestException:
-            resource_kind = None
-
-    return adapter_kind, resource_kind
-
-
-def find_vsan_cluster_resources(
-    session: requests.Session,
-    base_url: str,
-    verify: bool,
-    cluster_name: Optional[str] = None,
-    resource_kind_override: Optional[str] = None,
-    adapter_kind_override: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """Return every vSAN Cluster resource under the vSAN adapter.
-
-    With cluster_name omitted (the default), every vSAN Cluster resource found under
-    vSAN Adapter > vSAN Cluster is returned. Pass cluster_name to narrow the result to
-    one cluster (case-insensitive exact match).
-    """
-    adapter_kind, resource_kind = discover_vsan_adapter_and_cluster_kind(
-        session, base_url, verify, adapter_kind_override, resource_kind_override
+def api_get(host: str, token: str, path: str, verify: bool, **params) -> dict:
+    resp = httpx.get(
+        f"{host}/suite-api/api{path}",
+        params=params,
+        headers={"Accept": "application/json", "Authorization": f"vRealizeOpsToken {token}"},
+        verify=verify,
+        timeout=60.0,
     )
+    if resp.status_code >= 400:
+        raise OpsApiError(f"GET {path} 실패 ({resp.status_code}): {resp.text[:300]}")
+    return resp.json() if resp.content else {}
 
-    url = base_url + RESOURCES_QUERY_PATH
-    body: Dict[str, Any] = {"adapterKind": [adapter_kind]}
-    if resource_kind:
-        body["resourceKind"] = [resource_kind]
-    if cluster_name:
-        body["name"] = [cluster_name]
 
-    resp = session.post(url, json=body, verify=verify)
-    resp.raise_for_status()
-    resources = resp.json().get("resourceList", [])
+def api_post(host: str, token: str, path: str, body: dict, verify: bool, **params) -> dict:
+    resp = httpx.post(
+        f"{host}/suite-api/api{path}",
+        json=body,
+        params=params or None,
+        headers={"Accept": "application/json", "Authorization": f"vRealizeOpsToken {token}"},
+        verify=verify,
+        timeout=60.0,
+    )
+    if resp.status_code >= 400:
+        raise OpsApiError(f"POST {path} 실패 ({resp.status_code}): {resp.text[:300]}")
+    return resp.json() if resp.content else {}
 
-    if not resource_kind:
-        # Resource kind could not be resolved automatically - keep only resources that look
-        # like a vSAN cluster (not hosts, disk groups, etc. under the same adapter).
-        resources = [
-            r for r in resources
-            if "cluster" in r.get("resourceKey", {}).get("resourceKindKey", "").lower()
-        ] or resources
 
-    if cluster_name:
-        exact = [r for r in resources if r.get("resourceKey", {}).get("name", "").lower() == cluster_name.lower()]
-        resources = exact or resources
-
-    if not resources:
-        where = f"named '{cluster_name}'" if cluster_name else ""
-        raise RuntimeError(
-            f"No vSAN Cluster resource {where} was found "
-            f"(adapter kind tried: '{adapter_kind}', resource kind tried: '{resource_kind}'). "
-            "Check the name under VCF Operations > vSAN Adapter > vSAN Cluster, "
-            "or pass --adapter-kind / --resource-kind if your environment uses different keys "
-            "(see /suite-api/api/adapterkinds for the available keys)."
+def list_vsan_clusters(host: str, token: str, verify: bool) -> list[dict]:
+    """모든 vSAN Cluster(VirtualSANDCCluster) 리소스를 페이지 순회로 전부 가져온다."""
+    out: list[dict] = []
+    page = 0
+    while True:
+        data = api_get(
+            host, token, "/resources", verify,
+            adapterKind="VirtualAndPhysicalSANAdapter", resourceKind="VirtualSANDCCluster",
+            page=page, pageSize=1000,
         )
-    return resources
+        rows = data.get("resourceList") or []
+        out.extend(rows)
+        total = (data.get("pageInfo") or {}).get("totalCount", 0)
+        page += 1
+        if len(out) >= total or not rows:
+            return out
 
 
-def get_metric_keys(
-    session: requests.Session,
-    base_url: str,
-    adapter_kind: str,
-    resource_kind: str,
-    verify: bool,
-    target_names: List[str],
-) -> Dict[str, str]:
-    """Return {display_name: stat_key} for the attributes whose display name is in target_names."""
-    url = base_url + ATTRIBUTES_PATH.format(adapter_kind=adapter_kind, resource_kind=resource_kind)
-    resp = session.get(url, verify=verify)
-    resp.raise_for_status()
-    payload = resp.json()
-
-    # The wrapper key for this list has varied across API versions ("resourceTypeAttributes",
-    # "attribute", "resource-type-attribute", ...). Rather than guess one name, scan every
-    # list-valued field in the response and keep entries that look like an attribute
-    # definition (a dict with both "key" and "name").
-    attrs: List[Dict[str, Any]] = []
-    for value in payload.values():
-        if isinstance(value, list):
-            attrs.extend(
-                item for item in value
-                if isinstance(item, dict) and "key" in item and "name" in item
-            )
-
-    wanted = {name.lower(): name for name in target_names}
-    found: Dict[str, str] = {}
-    for attr in attrs:
-        display_name = attr.get("name", "")
-        key = attr.get("key", "")
-        if display_name.lower() in wanted and key:
-            found[wanted[display_name.lower()]] = key
-
-    missing = [name for name in target_names if name not in found]
-    if missing:
-        print(
-            "Warning: the following metrics were not found in this resource kind's attribute list "
-            f"and will be skipped: {missing}",
-            file=sys.stderr,
-        )
-    return found
+def diskspace_statkeys(host: str, token: str, resource_id: str, verify: bool) -> list[str]:
+    """이 리소스가 실제로 가진 statKey 중 'vsan|diskSpace|' 접두사(= vSAN > Disk Space
+    메트릭 그룹)에 해당하는 것만 추린다."""
+    data = api_get(host, token, f"/resources/{resource_id}/statkeys", verify)
+    keys = [k["key"] for k in data.get("stat-key") or []]
+    return sorted(k for k in keys if k.lower().startswith(DISKSPACE_PREFIX))
 
 
-def get_latest_stats(
-    session: requests.Session,
-    base_url: str,
-    resource_id: str,
-    stat_keys: List[str],
-    verify: bool,
-) -> Dict[str, float]:
-    """Return {stat_key: latest_value} for the given resource and stat keys."""
-    if not stat_keys:
+def latest_values(host: str, token: str, resource_id: str, keys: list[str], verify: bool) -> dict[str, tuple[float, int]]:
+    if not keys:
         return {}
-    url = base_url + STATS_LATEST_PATH.format(resource_id=resource_id)
-    resp = session.get(url, params={"statKey": stat_keys}, verify=verify)
-    resp.raise_for_status()
-    payload = resp.json()
-
-    values: Dict[str, float] = {}
-    for entry in payload.get("values", []):
-        for stat in entry.get("stat-list", {}).get("stat", []):
-            key = stat.get("statKey", {}).get("key")
-            data = stat.get("data", [])
-            if key and data:
-                values[key] = data[-1]  # most recent sample
-    return values
-
-
-def collect_metrics_for_resource(
-    session: requests.Session,
-    base_url: str,
-    resource: Dict[str, Any],
-    verify: bool,
-    metric_key_cache: Dict[str, Dict[str, str]],
-) -> Dict[str, Any]:
-    """Resolve and fetch the Disk Space metrics for one already-found resource."""
-    resource_id = resource["identifier"]
-    adapter_kind = resource["resourceKey"]["adapterKindKey"]
-    resource_kind = resource["resourceKey"]["resourceKindKey"]
-
-    # Metric-key resolution depends only on (adapter kind, resource kind), so it is cached
-    # and reused across clusters of the same resource kind instead of being looked up every time.
-    cache_key = f"{adapter_kind}:{resource_kind}"
-    if cache_key not in metric_key_cache:
-        metric_key_cache[cache_key] = get_metric_keys(
-            session, base_url, adapter_kind, resource_kind, verify, TARGET_METRIC_NAMES
-        )
-    name_to_key = metric_key_cache[cache_key]
-
-    key_to_value = get_latest_stats(session, base_url, resource_id, list(name_to_key.values()), verify)
-    metrics = {name: key_to_value.get(key) for name, key in name_to_key.items()}
-
-    return {
-        "cluster_name": resource["resourceKey"]["name"],
-        "resource_id": resource_id,
-        "adapter_kind": adapter_kind,
-        "resource_kind": resource_kind,
-        "metrics": metrics,
-    }
-
-
-def collect_disk_space_metrics(
-    base_url: str,
-    username: str,
-    password: str,
-    verify: bool,
-    cluster_name: Optional[str] = None,
-    resource_kind_override: Optional[str] = None,
-    adapter_kind_override: Optional[str] = None,
-    auth_source: str = "LOCAL",
-) -> List[Dict[str, Any]]:
-    """End-to-end: log in, find every vSAN Cluster resource (or just cluster_name if given),
-    resolve metric keys, fetch latest values for each, log out."""
-    session = requests.Session()
-    token = acquire_token(session, base_url, username, password, verify, auth_source)
-    try:
-        resources = find_vsan_cluster_resources(
-            session, base_url, verify, cluster_name, resource_kind_override, adapter_kind_override
-        )
-        metric_key_cache: Dict[str, Dict[str, str]] = {}
-        return [
-            collect_metrics_for_resource(session, base_url, resource, verify, metric_key_cache)
-            for resource in resources
-        ]
-    finally:
-        release_token(session, base_url, verify)
-        _ = token  # token itself is not needed after this point
-
-
-def print_table(result: Dict[str, Any]) -> None:
-    print(f"\nvSAN Cluster: {result['cluster_name']}  (resource id: {result['resource_id']})")
-    print(f"Adapter kind: {result['adapter_kind']}   Resource kind: {result['resource_kind']}")
-    print("-" * 60)
-    name_width = max(len(name) for name in TARGET_METRIC_NAMES) + 2
-    for name in TARGET_METRIC_NAMES:
-        value = result["metrics"].get(name)
-        shown = "N/A" if value is None else f"{value:,.2f}"
-        print(f"{name:<{name_width}}: {shown}")
-    print("-" * 60)
-
-
-def print_results(results: List[Dict[str, Any]]) -> None:
-    print(f"\nFound {len(results)} vSAN Cluster resource(s).")
-    for result in results:
-        print_table(result)
-
-
-def write_json(results: List[Dict[str, Any]], path: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
-    print(f"JSON written to {path}")
-
-
-def write_csv(results: List[Dict[str, Any]], path: str) -> None:
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["cluster_name", "metric", "value"])
-        for result in results:
-            for name, value in result["metrics"].items():
-                writer.writerow([result["cluster_name"], name, value])
-    print(f"CSV written to {path}")
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Fetch vSAN > Disk Space metrics from VCF Operations.")
-    parser.add_argument("--host", help="VCF Operations address, e.g. vcfops.example.local (https:// is added automatically)")
-    parser.add_argument("--username", help="VCF Operations username")
-    parser.add_argument("--password", help="VCF Operations password (omit to be prompted securely)")
-    parser.add_argument("--auth-source", default="LOCAL", help='Auth source for login (default: "LOCAL", for a local VCF Operations account)')
-    parser.add_argument(
-        "--cluster",
-        help="Optional vSAN Cluster name to limit the query to one cluster. "
-             "Omit to fetch every vSAN Cluster resource under vSAN Adapter > vSAN Cluster.",
+    data = api_post(
+        host, token, "/resources/stats/latest/query",
+        {"resourceId": [resource_id], "statKey": keys}, verify,
     )
-    parser.add_argument("--adapter-kind", help="Override the vSAN adapter kind key if auto-detection does not match your environment")
-    parser.add_argument("--resource-kind", help="Override the vSAN Cluster resource kind key if auto-detection does not match your environment")
-    parser.add_argument("--insecure", action="store_true", help="Skip TLS certificate verification (self-signed certificates)")
-    parser.add_argument("--output-json", help="Optional path to also write the result as JSON")
-    parser.add_argument("--output-csv", help="Optional path to also write the result as CSV")
-    return parser.parse_args()
+    out: dict[str, tuple[float, int]] = {}
+    for v in data.get("values") or []:
+        for s in (v.get("stat-list") or {}).get("stat") or []:
+            if s.get("data"):
+                out[s["statKey"]["key"]] = (s["data"][0], (s.get("timestamps") or [0])[0])
+    return out
 
 
 def main() -> int:
-    args = parse_args()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--host", required=True, help="VCF Operations 주소 (예: https://vcf-ops01.example.com)")
+    ap.add_argument("--username", required=True, help="로그인 계정")
+    ap.add_argument("--password", help="로그인 비밀번호 (생략 시 안전하게 프롬프트로 입력받음)")
+    ap.add_argument("--auth-source", default="local", help="인증 소스 (기본: local)")
+    ap.add_argument("--insecure", action="store_true", help="TLS 인증서 검증을 생략한다 (verify=False)")
+    args = ap.parse_args()
 
-    host = args.host or input("VCF Operations address (e.g. vcfops.example.local): ")
-    base_url = normalize_host(host)
-
-    username = args.username or input("Username: ")
-    password = args.password or getpass.getpass("Password: ")
-
-    cluster_name = args.cluster  # optional: None means "every vSAN Cluster resource"
-
+    host = args.host.rstrip("/")
+    password = args.password or getpass.getpass("비밀번호: ")
     verify = not args.insecure
-    if args.insecure:
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     try:
-        results = collect_disk_space_metrics(
-            base_url=base_url,
-            username=username,
-            password=password,
-            verify=verify,
-            cluster_name=cluster_name,
-            resource_kind_override=args.resource_kind,
-            adapter_kind_override=args.adapter_kind,
-            auth_source=args.auth_source,
-        )
-    except requests.HTTPError as exc:
-        print(f"HTTP error: {exc}", file=sys.stderr)
-        return 1
-    except requests.RequestException as exc:
-        print(f"Connection error: {exc}", file=sys.stderr)
-        return 1
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        token = acquire_token(host, args.username, password, args.auth_source, verify)
+        clusters = list_vsan_clusters(host, token, verify)
+    except OpsApiError as exc:
+        print(f"오류: {exc}", file=sys.stderr)
         return 1
 
-    print_results(results)
-    if args.output_json:
-        write_json(results, args.output_json)
-    if args.output_csv:
-        write_csv(results, args.output_csv)
+    if not clusters:
+        print("vSAN Cluster 리소스를 찾지 못했습니다 (VirtualAndPhysicalSANAdapter / VirtualSANDCCluster).")
+        return 0
+
+    print(f"vSAN 클러스터 {len(clusters)}개 발견\n")
+
+    for res in clusters:
+        rid = res["identifier"]
+        name = res.get("resourceKey", {}).get("name", rid)
+        try:
+            keys = diskspace_statkeys(host, token, rid, verify)
+            values = latest_values(host, token, rid, keys, verify)
+        except OpsApiError as exc:
+            print(f"=== {name} ===\n  조회 실패: {exc}\n")
+            continue
+
+        print(f"=== {name} (id={rid}) ===")
+        if not keys:
+            print("  'vSAN > Disk Space' 메트릭을 찾지 못했습니다.")
+        for key in keys:
+            if key in values:
+                value, ts_ms = values[key]
+                print(f"  {key:45s} = {value}")
+            else:
+                print(f"  {key:45s} = (값 없음)")
+        print()
+
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
