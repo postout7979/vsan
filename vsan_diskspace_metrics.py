@@ -78,7 +78,7 @@ import requests
 TOKEN_ACQUIRE_PATH = "/suite-api/api/auth/token/acquire"
 TOKEN_RELEASE_PATH = "/suite-api/api/auth/token/release"
 RESOURCES_QUERY_PATH = "/suite-api/api/resources/query"
-ATTRIBUTES_PATH = "/suite-api/api/adaptertypes/{adapter_kind}/resourcekinds/{resource_kind}/attributes"
+ATTRIBUTES_PATH = "/suite-api/api/adapterkinds/{adapter_kind}/resourcekinds/{resource_kind}/attributes"
 STATS_LATEST_PATH = "/suite-api/api/resources/{resource_id}/stats/latest"
 ADAPTER_KINDS_PATH = "/suite-api/api/adapterkinds"
 RESOURCE_KINDS_PATH = "/suite-api/api/adapterkinds/{adapter_kind}/resourcekinds"
