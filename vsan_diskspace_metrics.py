@@ -35,9 +35,12 @@ Assumptions / not verified
   resources/query, adaptertypes/.../attributes, stats/latest). This has
   not been tested against a live VCF 9.1 Operations instance; if an
   endpoint path has changed, adjust the *_PATH constants near the top.
-- The resource is looked up by adapter kind "VSAN" and a resource kind
-  whose key contains "cluster" (case-insensitive). If your environment
-  uses a different resource kind key, use --resource-kind to override.
+- The vSAN adapter kind key is assumed to be "VirtualAndPhysicalSANAdapter"
+  and its cluster resource kind "VirtualSANDCCluster" (the values used in
+  vRealize/Aria Operations). The script first tries these, then falls
+  back to searching /suite-api/api/adapterkinds and
+  /adapterkinds/{key}/resourcekinds for a key/name containing "vsan" /
+  "cluster". Use --adapter-kind / --resource-kind to force specific keys.
 - Self-signed certificates are common in closed/air-gapped environments;
   use --insecure to skip TLS verification (off by default).
 
@@ -77,9 +80,16 @@ TOKEN_RELEASE_PATH = "/suite-api/api/auth/token/release"
 RESOURCES_QUERY_PATH = "/suite-api/api/resources/query"
 ATTRIBUTES_PATH = "/suite-api/api/adaptertypes/{adapter_kind}/resourcekinds/{resource_kind}/attributes"
 STATS_LATEST_PATH = "/suite-api/api/resources/{resource_id}/stats/latest"
+ADAPTER_KINDS_PATH = "/suite-api/api/adapterkinds"
+RESOURCE_KINDS_PATH = "/suite-api/api/adapterkinds/{adapter_kind}/resourcekinds"
 
-# vSAN adapter kind key in VCF Operations / Aria Operations
-VSAN_ADAPTER_KIND = "VSAN"
+# The vSAN adapter's kind key has been "VirtualAndPhysicalSANAdapter" in vRealize / Aria /
+# VCF Operations, with cluster resource kind "VirtualSANDCCluster". These are tried first;
+# discover_vsan_adapter_and_cluster_kind() falls back to searching /adapterkinds and
+# /adapterkinds/{key}/resourcekinds by name if they do not match your environment (these
+# keys can differ slightly between versions).
+DEFAULT_VSAN_ADAPTER_KIND = "VirtualAndPhysicalSANAdapter"
+DEFAULT_VSAN_CLUSTER_RESOURCE_KIND = "VirtualSANDCCluster"
 
 # Display names of the metrics shown under vSAN > Disk Space in the UI.
 TARGET_METRIC_NAMES = [
@@ -146,23 +156,87 @@ def release_token(session: requests.Session, base_url: str, verify: bool) -> Non
         pass
 
 
+def discover_vsan_adapter_and_cluster_kind(
+    session: requests.Session,
+    base_url: str,
+    verify: bool,
+    adapter_kind_override: Optional[str] = None,
+    resource_kind_override: Optional[str] = None,
+):
+    """Work out the vSAN adapter kind key and its cluster resource kind key.
+
+    Uses the override(s) if given, then the documented defaults, then falls back to
+    searching /adapterkinds (by name/key containing "vsan") and
+    /adapterkinds/{key}/resourcekinds (by name/key containing "cluster"), so the script
+    still works if your VCF Operations version uses different keys.
+    """
+    if adapter_kind_override and resource_kind_override:
+        return adapter_kind_override, resource_kind_override
+
+    adapter_kind = adapter_kind_override
+    if not adapter_kind:
+        try:
+            resp = session.get(base_url + ADAPTER_KINDS_PATH, verify=verify)
+            resp.raise_for_status()
+            payload = resp.json()
+            kinds = payload.get("adapter-kind") or payload.get("adapterKind") or []
+            keys = {k.get("key", "") for k in kinds}
+            if DEFAULT_VSAN_ADAPTER_KIND in keys:
+                adapter_kind = DEFAULT_VSAN_ADAPTER_KIND
+            else:
+                matches = [
+                    k.get("key") for k in kinds
+                    if "vsan" in k.get("key", "").lower() or "vsan" in k.get("name", "").lower()
+                ]
+                adapter_kind = matches[0] if matches else DEFAULT_VSAN_ADAPTER_KIND
+        except requests.RequestException:
+            adapter_kind = DEFAULT_VSAN_ADAPTER_KIND
+
+    resource_kind = resource_kind_override
+    if not resource_kind:
+        try:
+            url = base_url + RESOURCE_KINDS_PATH.format(adapter_kind=adapter_kind)
+            resp = session.get(url, verify=verify)
+            resp.raise_for_status()
+            payload = resp.json()
+            rkinds = payload.get("resource-kind") or payload.get("resourceKind") or []
+            rkeys = {rk.get("key", "") for rk in rkinds}
+            if DEFAULT_VSAN_CLUSTER_RESOURCE_KIND in rkeys:
+                resource_kind = DEFAULT_VSAN_CLUSTER_RESOURCE_KIND
+            else:
+                matches = [
+                    rk.get("key") for rk in rkinds
+                    if "cluster" in rk.get("key", "").lower() or "cluster" in rk.get("name", "").lower()
+                ]
+                resource_kind = matches[0] if matches else None
+        except requests.RequestException:
+            resource_kind = None
+
+    return adapter_kind, resource_kind
+
+
 def find_vsan_cluster_resources(
     session: requests.Session,
     base_url: str,
     verify: bool,
     cluster_name: Optional[str] = None,
     resource_kind_override: Optional[str] = None,
+    adapter_kind_override: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Return every vSAN Cluster resource under the VSAN adapter.
+    """Return every vSAN Cluster resource under the vSAN adapter.
 
     With cluster_name omitted (the default), every vSAN Cluster resource found under
-    VSAN Adapter > vSAN Cluster is returned. Pass cluster_name to narrow the result to
+    vSAN Adapter > vSAN Cluster is returned. Pass cluster_name to narrow the result to
     one cluster (case-insensitive exact match).
     """
+    adapter_kind, resource_kind = discover_vsan_adapter_and_cluster_kind(
+        session, base_url, verify, adapter_kind_override, resource_kind_override
+    )
+
     url = base_url + RESOURCES_QUERY_PATH
-    body: Dict[str, Any] = {"adapterKind": [VSAN_ADAPTER_KIND]}
-    if resource_kind_override:
-        body["resourceKind"] = [resource_kind_override]
+    body: Dict[str, Any] = {"adapterKind": [adapter_kind]}
+    if resource_kind:
+        body["resourceKind"] = [resource_kind]
     if cluster_name:
         body["name"] = [cluster_name]
 
@@ -170,9 +244,9 @@ def find_vsan_cluster_resources(
     resp.raise_for_status()
     resources = resp.json().get("resourceList", [])
 
-    if not resource_kind_override:
-        # Keep only resources whose resource kind looks like a vSAN cluster (not hosts, disk
-        # groups, etc. that also live under the VSAN adapter).
+    if not resource_kind:
+        # Resource kind could not be resolved automatically - keep only resources that look
+        # like a vSAN cluster (not hosts, disk groups, etc. under the same adapter).
         resources = [
             r for r in resources
             if "cluster" in r.get("resourceKey", {}).get("resourceKindKey", "").lower()
@@ -185,9 +259,11 @@ def find_vsan_cluster_resources(
     if not resources:
         where = f"named '{cluster_name}'" if cluster_name else ""
         raise RuntimeError(
-            f"No VSAN-adapter vSAN Cluster resource {where} was found. "
-            "Check VCF Operations under vSAN Adapter > vSAN Cluster, "
-            "or pass --resource-kind if your environment uses a non-default resource kind."
+            f"No vSAN Cluster resource {where} was found "
+            f"(adapter kind tried: '{adapter_kind}', resource kind tried: '{resource_kind}'). "
+            "Check the name under VCF Operations > vSAN Adapter > vSAN Cluster, "
+            "or pass --adapter-kind / --resource-kind if your environment uses different keys "
+            "(see /suite-api/api/adapterkinds for the available keys)."
         )
     return resources
 
@@ -289,6 +365,7 @@ def collect_disk_space_metrics(
     verify: bool,
     cluster_name: Optional[str] = None,
     resource_kind_override: Optional[str] = None,
+    adapter_kind_override: Optional[str] = None,
     auth_source: str = "LOCAL",
 ) -> List[Dict[str, Any]]:
     """End-to-end: log in, find every vSAN Cluster resource (or just cluster_name if given),
@@ -296,7 +373,9 @@ def collect_disk_space_metrics(
     session = requests.Session()
     token = acquire_token(session, base_url, username, password, verify, auth_source)
     try:
-        resources = find_vsan_cluster_resources(session, base_url, verify, cluster_name, resource_kind_override)
+        resources = find_vsan_cluster_resources(
+            session, base_url, verify, cluster_name, resource_kind_override, adapter_kind_override
+        )
         metric_key_cache: Dict[str, Dict[str, str]] = {}
         return [
             collect_metrics_for_resource(session, base_url, resource, verify, metric_key_cache)
@@ -352,7 +431,8 @@ def parse_args() -> argparse.Namespace:
         help="Optional vSAN Cluster name to limit the query to one cluster. "
              "Omit to fetch every vSAN Cluster resource under vSAN Adapter > vSAN Cluster.",
     )
-    parser.add_argument("--resource-kind", help="Override the resource kind key if auto-detection does not match your environment")
+    parser.add_argument("--adapter-kind", help="Override the vSAN adapter kind key if auto-detection does not match your environment")
+    parser.add_argument("--resource-kind", help="Override the vSAN Cluster resource kind key if auto-detection does not match your environment")
     parser.add_argument("--insecure", action="store_true", help="Skip TLS certificate verification (self-signed certificates)")
     parser.add_argument("--output-json", help="Optional path to also write the result as JSON")
     parser.add_argument("--output-csv", help="Optional path to also write the result as CSV")
@@ -382,6 +462,7 @@ def main() -> int:
             verify=verify,
             cluster_name=cluster_name,
             resource_kind_override=args.resource_kind,
+            adapter_kind_override=args.adapter_kind,
             auth_source=args.auth_source,
         )
     except requests.HTTPError as exc:
