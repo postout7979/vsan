@@ -280,7 +280,19 @@ def get_metric_keys(
     url = base_url + ATTRIBUTES_PATH.format(adapter_kind=adapter_kind, resource_kind=resource_kind)
     resp = session.get(url, verify=verify)
     resp.raise_for_status()
-    attrs = resp.json().get("resourceTypeAttributes", [])
+    payload = resp.json()
+
+    # The wrapper key for this list has varied across API versions ("resourceTypeAttributes",
+    # "attribute", "resource-type-attribute", ...). Rather than guess one name, scan every
+    # list-valued field in the response and keep entries that look like an attribute
+    # definition (a dict with both "key" and "name").
+    attrs: List[Dict[str, Any]] = []
+    for value in payload.values():
+        if isinstance(value, list):
+            attrs.extend(
+                item for item in value
+                if isinstance(item, dict) and "key" in item and "name" in item
+            )
 
     wanted = {name.lower(): name for name in target_names}
     found: Dict[str, str] = {}
