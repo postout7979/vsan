@@ -43,11 +43,13 @@ Assumptions / not verified
 
 Usage
 -----
-  python3 vsan_diskspace_metrics.py --host vcfops.example.local --cluster "vSAN-Cluster-01"
+  # Fetch every vSAN Cluster resource found under vSAN Adapter > vSAN Cluster:
+  python3 vsan_diskspace_metrics.py --host vcfops.example.local
 
   # Address scheme is optional - "https://" is added automatically if missing.
   # Username / password are prompted for if not supplied on the command line.
 
+  # Limit to one cluster by name:
   python3 vsan_diskspace_metrics.py \
       --host vcfops.example.local \
       --username admin \
@@ -144,44 +146,50 @@ def release_token(session: requests.Session, base_url: str, verify: bool) -> Non
         pass
 
 
-def find_vsan_cluster_resource(
+def find_vsan_cluster_resources(
     session: requests.Session,
     base_url: str,
-    cluster_name: str,
     verify: bool,
+    cluster_name: Optional[str] = None,
     resource_kind_override: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Find the vSAN Cluster resource that matches cluster_name exactly (case-insensitive)."""
+) -> List[Dict[str, Any]]:
+    """Return every vSAN Cluster resource under the VSAN adapter.
+
+    With cluster_name omitted (the default), every vSAN Cluster resource found under
+    VSAN Adapter > vSAN Cluster is returned. Pass cluster_name to narrow the result to
+    one cluster (case-insensitive exact match).
+    """
     url = base_url + RESOURCES_QUERY_PATH
-    body: Dict[str, Any] = {"name": [cluster_name], "adapterKind": [VSAN_ADAPTER_KIND]}
+    body: Dict[str, Any] = {"adapterKind": [VSAN_ADAPTER_KIND]}
     if resource_kind_override:
         body["resourceKind"] = [resource_kind_override]
+    if cluster_name:
+        body["name"] = [cluster_name]
 
     resp = session.post(url, json=body, verify=verify)
     resp.raise_for_status()
     resources = resp.json().get("resourceList", [])
 
+    if not resource_kind_override:
+        # Keep only resources whose resource kind looks like a vSAN cluster (not hosts, disk
+        # groups, etc. that also live under the VSAN adapter).
+        resources = [
+            r for r in resources
+            if "cluster" in r.get("resourceKey", {}).get("resourceKindKey", "").lower()
+        ] or resources
+
+    if cluster_name:
+        exact = [r for r in resources if r.get("resourceKey", {}).get("name", "").lower() == cluster_name.lower()]
+        resources = exact or resources
+
     if not resources:
+        where = f"named '{cluster_name}'" if cluster_name else ""
         raise RuntimeError(
-            f"No VSAN-adapter resource named '{cluster_name}' was found. "
-            "Check the vSAN Cluster display name in VCF Operations (vSAN Adapter > vSAN Cluster), "
+            f"No VSAN-adapter vSAN Cluster resource {where} was found. "
+            "Check VCF Operations under vSAN Adapter > vSAN Cluster, "
             "or pass --resource-kind if your environment uses a non-default resource kind."
         )
-
-    # Prefer an exact (case-insensitive) name match; otherwise fall back to resourceKind containing "cluster".
-    exact = [r for r in resources if r.get("resourceKey", {}).get("name", "").lower() == cluster_name.lower()]
-    candidates = exact or resources
-    cluster_like = [
-        r for r in candidates
-        if "cluster" in r.get("resourceKey", {}).get("resourceKindKey", "").lower()
-    ]
-    chosen = (cluster_like or candidates)[0]
-
-    if len(resources) > 1 and not exact:
-        names = ", ".join(r.get("resourceKey", {}).get("name", "?") for r in resources)
-        print(f"Warning: multiple matches found ({names}); using '{chosen['resourceKey']['name']}'.", file=sys.stderr)
-
-    return chosen
+    return resources
 
 
 def get_metric_keys(
@@ -241,38 +249,59 @@ def get_latest_stats(
     return values
 
 
+def collect_metrics_for_resource(
+    session: requests.Session,
+    base_url: str,
+    resource: Dict[str, Any],
+    verify: bool,
+    metric_key_cache: Dict[str, Dict[str, str]],
+) -> Dict[str, Any]:
+    """Resolve and fetch the Disk Space metrics for one already-found resource."""
+    resource_id = resource["identifier"]
+    adapter_kind = resource["resourceKey"]["adapterKindKey"]
+    resource_kind = resource["resourceKey"]["resourceKindKey"]
+
+    # Metric-key resolution depends only on (adapter kind, resource kind), so it is cached
+    # and reused across clusters of the same resource kind instead of being looked up every time.
+    cache_key = f"{adapter_kind}:{resource_kind}"
+    if cache_key not in metric_key_cache:
+        metric_key_cache[cache_key] = get_metric_keys(
+            session, base_url, adapter_kind, resource_kind, verify, TARGET_METRIC_NAMES
+        )
+    name_to_key = metric_key_cache[cache_key]
+
+    key_to_value = get_latest_stats(session, base_url, resource_id, list(name_to_key.values()), verify)
+    metrics = {name: key_to_value.get(key) for name, key in name_to_key.items()}
+
+    return {
+        "cluster_name": resource["resourceKey"]["name"],
+        "resource_id": resource_id,
+        "adapter_kind": adapter_kind,
+        "resource_kind": resource_kind,
+        "metrics": metrics,
+    }
+
+
 def collect_disk_space_metrics(
     base_url: str,
     username: str,
     password: str,
-    cluster_name: str,
     verify: bool,
+    cluster_name: Optional[str] = None,
     resource_kind_override: Optional[str] = None,
     auth_source: str = "LOCAL",
-) -> Dict[str, Any]:
-    """End-to-end: log in, find the cluster, resolve metric keys, fetch latest values, log out."""
+) -> List[Dict[str, Any]]:
+    """End-to-end: log in, find every vSAN Cluster resource (or just cluster_name if given),
+    resolve metric keys, fetch latest values for each, log out."""
     session = requests.Session()
     token = acquire_token(session, base_url, username, password, verify, auth_source)
     try:
-        resource = find_vsan_cluster_resource(session, base_url, cluster_name, verify, resource_kind_override)
-        resource_id = resource["identifier"]
-        adapter_kind = resource["resourceKey"]["adapterKindKey"]
-        resource_kind = resource["resourceKey"]["resourceKindKey"]
-
-        name_to_key = get_metric_keys(session, base_url, adapter_kind, resource_kind, verify, TARGET_METRIC_NAMES)
-        key_to_value = get_latest_stats(session, base_url, resource_id, list(name_to_key.values()), verify)
-
-        metrics = {
-            name: key_to_value.get(key)
-            for name, key in name_to_key.items()
-        }
-        return {
-            "cluster_name": resource["resourceKey"]["name"],
-            "resource_id": resource_id,
-            "adapter_kind": adapter_kind,
-            "resource_kind": resource_kind,
-            "metrics": metrics,
-        }
+        resources = find_vsan_cluster_resources(session, base_url, verify, cluster_name, resource_kind_override)
+        metric_key_cache: Dict[str, Dict[str, str]] = {}
+        return [
+            collect_metrics_for_resource(session, base_url, resource, verify, metric_key_cache)
+            for resource in resources
+        ]
     finally:
         release_token(session, base_url, verify)
         _ = token  # token itself is not needed after this point
@@ -290,18 +319,25 @@ def print_table(result: Dict[str, Any]) -> None:
     print("-" * 60)
 
 
-def write_json(result: Dict[str, Any], path: str) -> None:
+def print_results(results: List[Dict[str, Any]]) -> None:
+    print(f"\nFound {len(results)} vSAN Cluster resource(s).")
+    for result in results:
+        print_table(result)
+
+
+def write_json(results: List[Dict[str, Any]], path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
+        json.dump(results, f, indent=2, ensure_ascii=False)
     print(f"JSON written to {path}")
 
 
-def write_csv(result: Dict[str, Any], path: str) -> None:
+def write_csv(results: List[Dict[str, Any]], path: str) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["cluster_name", "metric", "value"])
-        for name, value in result["metrics"].items():
-            writer.writerow([result["cluster_name"], name, value])
+        for result in results:
+            for name, value in result["metrics"].items():
+                writer.writerow([result["cluster_name"], name, value])
     print(f"CSV written to {path}")
 
 
@@ -311,7 +347,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--username", help="VCF Operations username")
     parser.add_argument("--password", help="VCF Operations password (omit to be prompted securely)")
     parser.add_argument("--auth-source", default="LOCAL", help='Auth source for login (default: "LOCAL", for a local VCF Operations account)')
-    parser.add_argument("--cluster", help="vSAN Cluster resource name, as shown under vSAN Adapter > vSAN Cluster")
+    parser.add_argument(
+        "--cluster",
+        help="Optional vSAN Cluster name to limit the query to one cluster. "
+             "Omit to fetch every vSAN Cluster resource under vSAN Adapter > vSAN Cluster.",
+    )
     parser.add_argument("--resource-kind", help="Override the resource kind key if auto-detection does not match your environment")
     parser.add_argument("--insecure", action="store_true", help="Skip TLS certificate verification (self-signed certificates)")
     parser.add_argument("--output-json", help="Optional path to also write the result as JSON")
@@ -328,19 +368,19 @@ def main() -> int:
     username = args.username or input("Username: ")
     password = args.password or getpass.getpass("Password: ")
 
-    cluster_name = args.cluster or input("vSAN Cluster name: ")
+    cluster_name = args.cluster  # optional: None means "every vSAN Cluster resource"
 
     verify = not args.insecure
     if args.insecure:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     try:
-        result = collect_disk_space_metrics(
+        results = collect_disk_space_metrics(
             base_url=base_url,
             username=username,
             password=password,
-            cluster_name=cluster_name,
             verify=verify,
+            cluster_name=cluster_name,
             resource_kind_override=args.resource_kind,
             auth_source=args.auth_source,
         )
@@ -354,11 +394,11 @@ def main() -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    print_table(result)
+    print_results(results)
     if args.output_json:
-        write_json(result, args.output_json)
+        write_json(results, args.output_json)
     if args.output_csv:
-        write_csv(result, args.output_csv)
+        write_csv(results, args.output_csv)
     return 0
 
 
